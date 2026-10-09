@@ -113,7 +113,20 @@ gcloud artifacts repositories set-cleanup-policies cloud-run-source-deploy \
 
 ---
 
-## 2. GitHub → Cloud Run (auto-deploy on every push to `main`)
+## 2a. Manual deploy from your machine: `./deploy.sh`
+
+```bash
+gcloud auth login && gcloud config set project PROJECT_ID
+./deploy.sh 'YOUR_PASSWORD' 'GEMINI_API_KEY' 'BUCKET'      # 2nd and 3rd argument optional
+```
+
+The script enables the Cloud Run / Cloud Build / Artifact Registry / Cloud Storage APIs and runs the same
+`gcloud run deploy clipper --source . --region europe-west1 --cpu 2 --memory 4Gi --timeout 3600
+--min-instances 0 --max-instances 1 --concurrency 4 --allow-unauthenticated` as the GitHub Action,
+with `PASSWORD`, `GEMINI_API_KEY` and `GCS_BUCKET` set as env vars. Override the region/service with
+`GCP_REGION` / `SERVICE`, the runtime service account with `CLOUD_RUN_SA`.
+
+## 2b. GitHub → Cloud Run (auto-deploy on every push to `main`)
 
 The workflow `.github/workflows/deploy-cloudrun.yml` authenticates with `google-github-actions/auth`
 and runs
@@ -274,6 +287,7 @@ gcs.py            optional Cloud Storage persistence + signed URLs
 rules.yaml        editable rules (whisper_model, max_video_minutes, lengths, subtitles, caption template …)
 requirements.txt  Python deps
 Dockerfile        python:3.11-slim + ffmpeg + fonts + deno + whisper base/small baked in; listens on $PORT
+deploy.sh         manual one-shot deploy (enables APIs + gcloud run deploy)
 .github/workflows/deploy-cloudrun.yml   gcloud run deploy on push to main
 fonts/, models/   Montserrat-Bold.ttf (SIL OFL), mediapipe BlazeFace model (Apache-2.0)
 logos/            saved logo PNGs (uploads land here; mirrored to the bucket)
