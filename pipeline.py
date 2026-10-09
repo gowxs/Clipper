@@ -307,6 +307,68 @@ def js_runtime_args() -> list[str]:
 # --------------------------------------------------------------------------- #
 # 1) Download
 # --------------------------------------------------------------------------- #
+
+_DRIVE_ID_PATTERNS = (
+    re.compile(r"/file/d/([A-Za-z0-9_-]{10,})"),
+    re.compile(r"[?&]id=([A-Za-z0-9_-]{10,})"),
+    re.compile(r"/folders/([A-Za-z0-9_-]{10,})"),
+    re.compile(r"/d/([A-Za-z0-9_-]{10,})"),
+    re.compile(r"/uc\?.*?id=([A-Za-z0-9_-]{10,})"),
+)
+
+
+def google_drive_id(url: str) -> tuple[Optional[str], bool]:
+    """Return (id, is_folder) extracted from any Google Drive share link; (None, False) if not found."""
+    for pat in _DRIVE_ID_PATTERNS:
+        m = pat.search(url)
+        if m:
+            return m.group(1), "/folders/" in url
+    return None, False
+
+
+def _gdown_call(func, **kwargs):
+    """Call a gdown function with only the keyword arguments its installed version supports."""
+    import inspect
+
+    allowed = set(inspect.signature(func).parameters)
+    return func(**{k: v for k, v in kwargs.items() if k in allowed})
+
+
+def download_google_drive(url: str, target_dir: Path, job: Job) -> Path:
+    """Download a publicly shared Google Drive file (or the largest video of a shared folder)."""
+    import gdown
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    file_id, is_folder = google_drive_id(url)
+    if not file_id:
+        raise RuntimeError("Could not find a file id in the Google Drive link. Use the 'Share → Copy link' URL "
+                           "(https://drive.google.com/file/d/<id>/view) with access 'Anyone with the link'.")
+    job.log(f"Downloading from Google Drive ({'folder' if is_folder else 'file'} {file_id}) with gdown {getattr(gdown, '__version__', '?')} ...")
+    try:
+        if is_folder:
+            out = _gdown_call(gdown.download_folder, id=file_id, output=str(target_dir), quiet=True,
+                              use_cookies=False, remaining_ok=True)
+        else:
+            out = _gdown_call(gdown.download, id=file_id, output=str(target_dir) + os.sep, quiet=True,
+                              use_cookies=False, retries=3)
+    except Exception as e:
+        raise RuntimeError(f"Google Drive download failed: {e}. Is the file shared as 'Anyone with the link'? "
+                           f"Very large files may need the owner to allow downloads.") from e
+    if not out:
+        raise RuntimeError("gdown returned nothing (is the link shared publicly? quota exceeded?)")
+    # resolve to the actual media file
+    candidates = [p for p in target_dir.rglob("*") if p.is_file()]
+    if not candidates:
+        raise RuntimeError("Google Drive download produced no file")
+    video_exts = {".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi", ".ts", ".mpg", ".mpeg", ".3gp", ".flv"}
+    videos = [p for p in candidates if p.suffix.lower() in video_exts]
+    path = max(videos or candidates, key=lambda p: p.stat().st_size)
+    if path.stat().st_size < 10_000 and path.suffix.lower() in (".html", ".htm", ""):
+        raise RuntimeError("Google Drive returned an HTML page instead of the file — the link is not public "
+                           "or the download needs confirmation.")
+    return path
+
+
 def download_source(url: str, workdir: Path, cookies: Optional[str], job: Job) -> tuple[str, str]:
     """Return (local_path, title)."""
     workdir.mkdir(parents=True, exist_ok=True)
@@ -318,20 +380,7 @@ def download_source(url: str, workdir: Path, cookies: Optional[str], job: Job) -
         path = gcs.download_gs_uri(url, workdir / "gcs")
         return str(path), path.stem
     if is_google_drive(url):
-        import gdown
-
-        job.log("Downloading from Google Drive with gdown ...")
-        target_dir = workdir / "gdrive"
-        target_dir.mkdir(exist_ok=True)
-        out = gdown.download(url=url, output=str(target_dir) + "/", quiet=True, fuzzy=True)
-        if not out:
-            raise RuntimeError("gdown could not download the file (is the link shared publicly?)")
-        path = Path(out)
-        if path.is_dir():
-            files = sorted(path.iterdir(), key=lambda p: p.stat().st_size, reverse=True)
-            if not files:
-                raise RuntimeError("gdown downloaded an empty folder")
-            path = files[0]
+        path = download_google_drive(url, workdir / "gdrive", job)
         return str(path), path.stem
 
     # yt-dlp (YouTube, Kick, ...)

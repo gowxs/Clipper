@@ -7,7 +7,7 @@ av>=13.1,<=14.2.0; python_version < "3.12"
 av>=14; python_version >= "3.12"
 numpy>=1.26
 PyYAML>=6.0
-gdown>=5.2
+gdown>=5.2,<7
 mediapipe>=0.10.14,<2
 google-genai>=1.0
 google-cloud-storage>=2.16
