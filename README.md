@@ -287,11 +287,32 @@ gcs.py            optional Cloud Storage persistence + signed URLs
 rules.yaml        editable rules (whisper_model, max_video_minutes, lengths, subtitles, caption template …)
 requirements.txt  Python deps
 Dockerfile        python:3.11-slim + ffmpeg + fonts + deno + whisper base/small baked in; listens on $PORT
+prefetch_models.py  build-time whisper model download with retries (non-fatal)
 deploy.sh         manual one-shot deploy (enables APIs + gcloud run deploy)
 .github/workflows/deploy-cloudrun.yml   gcloud run deploy on push to main
 fonts/, models/   Montserrat-Bold.ttf (SIL OFL), mediapipe BlazeFace model (Apache-2.0)
 logos/            saved logo PNGs (uploads land here; mirrored to the bucket)
 ```
+
+## Build troubleshooting (Cloud Build)
+
+The image is built by Cloud Build's classic Docker builder, so the Dockerfile avoids BuildKit-only syntax.
+Things that were made robust after a failed build:
+
+- **PyAV**: `faster-whisper` imports `av`; `av` 14.3+/15+ publish no CPython 3.11 Linux wheels, so an
+  unpinned `av` makes pip compile it from source (needs ffmpeg headers) and the build dies right after the
+  apt step. `requirements.txt` pins `av<=14.2.0` on Python < 3.12 and the Dockerfile installs with
+  `--only-binary=:all:` so any missing wheel fails loudly instead of compiling.
+- **deno** (JS runtime for yt-dlp's YouTube extractor): installed from the official PyPI wheel (`pip install deno`),
+  with the install script as fallback; both are optional and never fail the build.
+- **Whisper models**: `prefetch_models.py` downloads `base` and `small` with retries and never fails the
+  build (missing models are fetched on first use). The download runs as UID 1000 so no large `chown` layer.
+- **Fonts / face model**: committed in the repo; network fallbacks are non-fatal.
+- Lint: `hadolint Dockerfile` is clean. Dependency set verified with a real CPython 3.11 venv
+  (`pip install --only-binary=:all: -r requirements.txt` → imports OK, pipeline run OK).
+
+To read a failed build log from a laptop: *Cloud Build → History → the red build → Build log*, or
+`gcloud builds list --region europe-west1 --limit 3` and `gcloud builds log BUILD_ID --region europe-west1`.
 
 ## Notes & limits
 

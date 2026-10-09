@@ -2,11 +2,13 @@ gradio>=6.0,<7
 yt-dlp>=2025.9.1
 faster-whisper>=1.1.1
 ctranslate2>=4.4
-av>=11,<15
+# PyAV: faster-whisper imports it; 14.3+/15+ ship no CPython 3.11 Linux wheels -> pin to wheel-only versions
+av>=13.1,<=14.2.0; python_version < "3.12"
+av>=14; python_version >= "3.12"
 numpy>=1.26
 PyYAML>=6.0
 gdown>=5.2
-mediapipe>=0.10.14
+mediapipe>=0.10.14,<2
 google-genai>=1.0
 google-cloud-storage>=2.16
 google-auth>=2.29
