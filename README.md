@@ -161,6 +161,21 @@ The workflow is skipped while `GCP_PROJECT_ID` is unset, so the repo also works 
 - **History**: last 20 jobs; ☁️ entries have signed links to `clips.zip`/`captions.md` in the bucket, 💾
   entries exist only while the instance lives.
 
+### Logos
+
+`rules.yaml` → `logos:` has two slots, `my_logo` (default corner bottom-right) and `campaign_logo` (top-left).
+Each has `enabled`, `file` (name in `logos/` or an absolute path), `position` (`top_left|top_right|bottom_left|bottom_right`),
+`width_pct` (12 % of the 1080 px frame), `opacity` (0.85), `margin_px` (40) and `show` (`always|first_3s|last_3s`).
+Logos are overlaid **after** subtitles and hook with an ffmpeg `filter_complex` (`scale` → `overlay`), and are
+kept out of the text bands: top-corner logos are capped so they end above y = 200 (the hook band starts at
+y ≈ 230), bottom-corner logos start below y = 1500 (subtitles end at y ≈ 1440). Two enabled logos must use
+different corners.
+
+In the **Process** tab the *Logos* accordion has, per slot, an upload field and a dropdown of saved logos.
+An uploaded PNG is stored in `logos/` (and in `gs://BUCKET/clipper/logos/` when a bucket is configured) so
+it can be picked from the list next time without re-uploading. Upload or a picked name enables the logo for
+that job; `(none)` disables it; `(rules.yaml default)` follows the rules file. CLI: `--my-logo`, `--campaign-logo`.
+
 ### Uploads on Cloud Run
 
 Cloud Run rejects HTTP/1 request bodies above 32 MiB, so the upload field is limited to 30 MB there.
@@ -261,6 +276,7 @@ requirements.txt  Python deps
 Dockerfile        python:3.11-slim + ffmpeg + fonts + deno + whisper base/small baked in; listens on $PORT
 .github/workflows/deploy-cloudrun.yml   gcloud run deploy on push to main
 fonts/, models/   Montserrat-Bold.ttf (SIL OFL), mediapipe BlazeFace model (Apache-2.0)
+logos/            saved logo PNGs (uploads land here; mirrored to the bucket)
 ```
 
 ## Notes & limits

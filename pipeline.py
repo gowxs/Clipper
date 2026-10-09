@@ -58,7 +58,22 @@ DEFAULT_RULES: dict = {
     },
     "caption_template": "{hook}\n\n{title} #Ad\n\n{hashtags}\n",
     "audience_notes": "",
+    "logos": {
+        "my_logo": {"enabled": False, "file": "my_logo.png", "position": "bottom_right", "width_pct": 12,
+                    "opacity": 0.85, "margin_px": 40, "show": "always"},
+        "campaign_logo": {"enabled": False, "file": "campaign_logo.png", "position": "top_left", "width_pct": 12,
+                          "opacity": 0.85, "margin_px": 40, "show": "always"},
+    },
 }
+
+LOGOS_DIR = BASE_DIR / "logos"
+LOGO_SLOTS = ("my_logo", "campaign_logo")
+LOGO_POSITIONS = ("top_left", "top_right", "bottom_left", "bottom_right")
+LOGO_SHOW = ("always", "first_3s", "last_3s")
+# Safe zones on the 1080x1920 canvas: hook text lives in the upper third (y >= 230, centred),
+# subtitles in the lower third (y <= ~1440). Logos stay in the corners and must not enter those bands.
+LOGO_TOP_MAX_Y = 200        # bottom edge of a top-corner logo must stay above this
+LOGO_BOTTOM_MIN_Y = 1500    # top edge of a bottom-corner logo must stay below this
 
 DEFAULT_RULES_TEXT = """# Clipper rules — edit in the "Rules" tab or directly in this file.
 
@@ -104,6 +119,30 @@ caption_template: |
 audience_notes: |
   Short-form audience (TikTok / Reels / Shorts). Prefer moments with a strong
   opening line, a clear point, humour or surprise. Avoid slow or context-dependent parts.
+
+# Logo overlays (PNG with transparency). `file` is a name inside logos/ (local folder or the GCS bucket)
+# or an absolute path. Logos sit in the corners and never enter the hook band (upper third, centre)
+# or the subtitle band (lower third): top logos are capped at y<200, bottom logos start below y>1500.
+#   position: top_left | top_right | bottom_left | bottom_right
+#   width_pct: width as % of the 1080 px frame (3–30)
+#   show: always | first_3s | last_3s
+logos:
+  my_logo:
+    enabled: false
+    file: my_logo.png
+    position: bottom_right
+    width_pct: 12
+    opacity: 0.85
+    margin_px: 40
+    show: always
+  campaign_logo:
+    enabled: false
+    file: campaign_logo.png
+    position: top_left
+    width_pct: 12
+    opacity: 0.85
+    margin_px: 40
+    show: always
 """
 
 _history_lock = threading.Lock()
@@ -153,6 +192,19 @@ def save_rules_text(text: str, path: Path = RULES_PATH) -> dict:
         raise ValueError(f"whisper_model must be one of {', '.join(ALLOWED_WHISPER_MODELS)}")
     if float(merged.get("max_video_minutes", 60)) <= 0:
         raise ValueError("max_video_minutes must be > 0")
+    for slot in LOGO_SLOTS:
+        lg = (merged.get("logos") or {}).get(slot) or {}
+        if lg.get("position", "bottom_right") not in LOGO_POSITIONS:
+            raise ValueError(f"logos.{slot}.position must be one of {', '.join(LOGO_POSITIONS)}")
+        if lg.get("show", "always") not in LOGO_SHOW:
+            raise ValueError(f"logos.{slot}.show must be one of {', '.join(LOGO_SHOW)}")
+        if not (3 <= float(lg.get("width_pct", 12)) <= 30):
+            raise ValueError(f"logos.{slot}.width_pct must be between 3 and 30")
+        if not (0 < float(lg.get("opacity", 0.85)) <= 1):
+            raise ValueError(f"logos.{slot}.opacity must be in (0, 1]")
+    used = [lg.get("position") for lg in (merged.get("logos") or {}).values() if lg and lg.get("enabled")]
+    if len(used) != len(set(used)):
+        raise ValueError("enabled logos must use different corners")
     path.write_text(text, encoding="utf-8")
     return merged
 
@@ -898,8 +950,134 @@ def detect_face_center(src: str, start: float, end: float, workdir: Path, n_fram
     return float(np.median(centers))
 
 
+# --------------------------------------------------------------------------- #
+# Logos
+# --------------------------------------------------------------------------- #
+def list_saved_logos() -> list[str]:
+    """Names of PNG logos available in logos/ (local) plus the GCS logo folder."""
+    names = set()
+    if LOGOS_DIR.exists():
+        names.update(p.name for p in LOGOS_DIR.iterdir() if p.suffix.lower() in (".png", ".webp"))
+    try:
+        import gcs
+
+        names.update(gcs.list_logos())
+    except Exception:
+        pass
+    return sorted(names)
+
+
+def save_logo(src_path: str, name: Optional[str] = None) -> str:
+    """Copy an uploaded logo into logos/ (and the bucket). Returns the stored name."""
+    src = Path(src_path)
+    name = sanitize_filename(name or src.stem) + (src.suffix.lower() if src.suffix.lower() in (".png", ".webp") else ".png")
+    LOGOS_DIR.mkdir(parents=True, exist_ok=True)
+    dst = LOGOS_DIR / name
+    if src.resolve() != dst.resolve():
+        shutil.copy(src, dst)
+    try:
+        import gcs
+
+        gcs.upload_logo(dst, name)
+    except Exception as e:
+        print(f"[logos] GCS upload skipped: {e}", flush=True)
+    return name
+
+
+def resolve_logo(file_or_name: str) -> Optional[Path]:
+    """Absolute path → as is; otherwise look in logos/ and then in the bucket (cached locally)."""
+    if not file_or_name:
+        return None
+    p = Path(file_or_name)
+    if p.is_absolute() and p.exists():
+        return p
+    local = LOGOS_DIR / p.name
+    if local.exists():
+        return local
+    try:
+        import gcs
+
+        if gcs.enabled() and gcs.download_logo(p.name, local):
+            return local
+    except Exception:
+        pass
+    return None
+
+
+def active_logos(rules: dict, overrides: Optional[dict] = None, log=None) -> list[dict]:
+    """
+    Merge rules.logos with per-job overrides {slot: path|None}. An override path enables the slot for this
+    job; an override of "" / None disables it. Returns [{slot, path, position, width_pct, opacity, margin_px, show}].
+    """
+    overrides = overrides or {}
+    out = []
+    for slot in LOGO_SLOTS:
+        cfg = dict(DEFAULT_RULES["logos"][slot])
+        cfg.update((rules.get("logos") or {}).get(slot) or {})
+        if slot in overrides:
+            if not overrides[slot]:
+                continue
+            path = resolve_logo(str(overrides[slot]))
+        else:
+            if not cfg.get("enabled"):
+                continue
+            path = resolve_logo(str(cfg.get("file", "")))
+        if path is None:
+            if log:
+                log(f"  logo '{slot}': file '{overrides.get(slot) or cfg.get('file')}' not found — skipped")
+            continue
+        out.append({"slot": slot, "path": str(path), "position": cfg.get("position", "bottom_right"),
+                    "width_pct": float(cfg.get("width_pct", 12)), "opacity": float(cfg.get("opacity", 0.85)),
+                    "margin_px": int(cfg.get("margin_px", 40)), "show": cfg.get("show", "always")})
+    # keep corners unique (first wins)
+    seen = set()
+    uniq = []
+    for lg in out:
+        if lg["position"] in seen:
+            if log:
+                log(f"  logo '{lg['slot']}': corner {lg['position']} already used — skipped")
+            continue
+        seen.add(lg["position"])
+        uniq.append(lg)
+    return uniq
+
+
+def logo_filter_chain(logos: list[dict], first_input_index: int, dur: float, in_label: str = "base") -> tuple[str, str]:
+    """
+    Build the filter_complex fragment that scales each logo into its safe corner and overlays it on
+    [in_label]. Returns (filter_text, final_label).
+    """
+    parts = []
+    cur = in_label
+    for i, lg in enumerate(logos):
+        idx = first_input_index + i
+        pos = lg["position"] if lg["position"] in LOGO_POSITIONS else "bottom_right"
+        m = max(0, int(lg["margin_px"]))
+        width = int(1080 * min(max(lg["width_pct"], 3.0), 30.0) / 100)
+        # vertical cap so the logo never reaches the hook / subtitle bands
+        if pos.startswith("top"):
+            max_h = max(24, LOGO_TOP_MAX_Y - m)
+        else:
+            max_h = max(24, 1920 - m - LOGO_BOTTOM_MIN_Y)
+        alpha = min(max(lg["opacity"], 0.05), 1.0)
+        lbl = f"lg{i}"
+        parts.append(f"[{idx}:v]format=rgba,scale=w={width}:h={max_h}:force_original_aspect_ratio=decrease,"
+                     f"colorchannelmixer=aa={alpha:.3f}[{lbl}]")
+        x = f"{m}" if pos.endswith("left") else f"main_w-overlay_w-{m}"
+        y = f"{m}" if pos.startswith("top") else f"main_h-overlay_h-{m}"
+        enable = ""
+        if lg["show"] == "first_3s":
+            enable = ":enable='lte(t,3)'"
+        elif lg["show"] == "last_3s":
+            enable = f":enable='gte(t,{max(0.0, dur - 3):.3f})'"
+        nxt = f"v{i}"
+        parts.append(f"[{cur}][{lbl}]overlay=x={x}:y={y}:format=auto:eof_action=repeat{enable}[{nxt}]")
+        cur = nxt
+    return ";".join(parts), cur
+
+
 def render_clip(src: str, clip: dict, ass_path: str, out_path: str, src_info: dict, face_cx: Optional[float],
-                job: Job):
+                job: Job, logos: Optional[list[dict]] = None):
     w, h = src_info["width"], src_info["height"]
     start, end = clip["start"], clip["end"]
     dur = end - start
@@ -912,15 +1090,26 @@ def render_clip(src: str, clip: dict, ass_path: str, out_path: str, src_info: di
         crop = f"crop={crop_w}:{h}:{x}:0,"
     else:
         crop = ""
-    vf = (
-        f"{crop}scale=1080:1920:force_original_aspect_ratio=decrease,"
+    base = (
+        f"[0:v]{crop}scale=1080:1920:force_original_aspect_ratio=decrease,"
         f"pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,"
-        f"subtitles='{_ff_escape(ass_path)}':fontsdir='{_ff_escape(str(FONTS_DIR))}'"
+        f"subtitles='{_ff_escape(ass_path)}':fontsdir='{_ff_escape(str(FONTS_DIR))}'[base]"
     )
+    logos = logos or []
+    logo_inputs: list[str] = []
+    for lg in logos:
+        logo_inputs += ["-i", lg["path"]]
+    if logos:
+        chain, final = logo_filter_chain(logos, first_input_index=1, dur=dur)
+        filter_complex = base + ";" + chain
+    else:
+        filter_complex, final = base, "base"
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error", "-hide_banner",
         "-ss", f"{start:.3f}", "-t", f"{dur:.3f}", "-i", src,
-        "-vf", vf,
+        *logo_inputs,
+        "-filter_complex", filter_complex,
+        "-map", f"[{final}]", "-map", "0:a:0",
         "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
         "-r", "30",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
@@ -1035,7 +1224,7 @@ def append_history(entry: dict, keep: int = 20):
 # Orchestration
 # --------------------------------------------------------------------------- #
 def process(job: Job, url: str = "", local_file: Optional[str] = None, cookies_path: Optional[str] = None,
-            mode: str = "local", rules: Optional[dict] = None):
+            mode: str = "local", rules: Optional[dict] = None, logo_overrides: Optional[dict] = None):
     rules = rules or load_rules()
     workdir = WORK_DIR / job.id
     out_dir = job.out_dir
@@ -1082,6 +1271,9 @@ def process(job: Job, url: str = "", local_file: Optional[str] = None, cookies_p
         job.log(f"{len(clips)} moments selected", progress=0.55)
 
         # 4) render
+        logos = active_logos(rules, logo_overrides, log=job.log)
+        if logos:
+            job.log("Logos: " + ", ".join(f"{l['slot']} ({l['position']}, {l['show']})" for l in logos))
         rendered: list[Path] = []
         for i, clip in enumerate(clips, start=1):
             name = f"clip_{i:02d}.mp4"
@@ -1093,7 +1285,7 @@ def process(job: Job, url: str = "", local_file: Optional[str] = None, cookies_p
             ass_path = str(workdir / f"clip_{i:02d}.ass")
             build_ass(clip, rules, ass_path, clip.get("hook", ""))
             job.log(f"  rendering {name} ({clip['start']:.1f}-{clip['end']:.1f}s) ...")
-            render_clip(src, clip, ass_path, str(out_path), info, face_cx, job)
+            render_clip(src, clip, ass_path, str(out_path), info, face_cx, job, logos)
             clip["file"] = str(out_path)
             clip["caption_text"] = fill_caption(rules["caption_template"], clip, title)
             rendered.append(out_path)
@@ -1155,12 +1347,19 @@ if __name__ == "__main__":  # simple CLI for local testing
     ap.add_argument("source", help="URL or local video path")
     ap.add_argument("--cookies", default=None)
     ap.add_argument("--mode", default="local", choices=["local", "gemini"])
+    ap.add_argument("--my-logo", default=None, help="PNG path or name in logos/ (overrides rules.yaml)")
+    ap.add_argument("--campaign-logo", default=None, help="PNG path or name in logos/ (overrides rules.yaml)")
     args = ap.parse_args()
+    overrides = {}
+    if args.my_logo is not None:
+        overrides["my_logo"] = args.my_logo
+    if args.campaign_logo is not None:
+        overrides["campaign_logo"] = args.campaign_logo
     job = Job()
     if os.path.exists(args.source):
-        process(job, local_file=args.source, cookies_path=args.cookies, mode=args.mode)
+        process(job, local_file=args.source, cookies_path=args.cookies, mode=args.mode, logo_overrides=overrides)
     else:
-        process(job, url=args.source, cookies_path=args.cookies, mode=args.mode)
+        process(job, url=args.source, cookies_path=args.cookies, mode=args.mode, logo_overrides=overrides)
     print(json.dumps({"status": job.status, "error": job.error, "clips": job.clips, "zip": job.zip_path},
                      indent=1, ensure_ascii=False))
     raise SystemExit(0 if job.status == "done" else 1)

@@ -227,3 +227,45 @@ def delete_job(job_id: str):
             blob.delete()
     except Exception as e:  # pragma: no cover
         print(f"[gcs] delete {job_id} failed: {e}", flush=True)
+
+
+# --------------------------------------------------------------------------- #
+# logo library  (<prefix>/logos/<name>.png)
+# --------------------------------------------------------------------------- #
+def logos_prefix() -> str:
+    return f"{PREFIX}/logos" if PREFIX else "logos"
+
+
+def list_logos() -> list[str]:
+    if not enabled():
+        return []
+    try:
+        pre = logos_prefix() + "/"
+        return [b.name[len(pre):] for b in _get_client().list_blobs(BUCKET, prefix=pre)
+                if b.name != pre and b.name.lower().endswith((".png", ".webp"))]
+    except Exception as e:  # pragma: no cover
+        print(f"[gcs] listing logos failed: {e}", flush=True)
+        return []
+
+
+def upload_logo(local_path: str | Path, name: str) -> Optional[str]:
+    if not enabled():
+        return None
+    blob = _bucket().blob(f"{logos_prefix()}/{name}")
+    blob.upload_from_filename(str(local_path), content_type="image/png", timeout=120)
+    return f"gs://{BUCKET}/{blob.name}"
+
+
+def download_logo(name: str, dest: str | Path) -> bool:
+    if not enabled():
+        return False
+    try:
+        blob = _bucket().blob(f"{logos_prefix()}/{name}")
+        if not blob.exists():
+            return False
+        Path(dest).parent.mkdir(parents=True, exist_ok=True)
+        blob.download_to_filename(str(dest), timeout=120)
+        return True
+    except Exception as e:  # pragma: no cover
+        print(f"[gcs] downloading logo {name} failed: {e}", flush=True)
+        return False

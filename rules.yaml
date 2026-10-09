@@ -42,3 +42,27 @@ caption_template: |
 audience_notes: |
   Short-form audience (TikTok / Reels / Shorts). Prefer moments with a strong
   opening line, a clear point, humour or surprise. Avoid slow or context-dependent parts.
+
+# Logo overlays (PNG with transparency). `file` is a name inside logos/ (local folder or the GCS bucket)
+# or an absolute path. Logos sit in the corners and never enter the hook band (upper third, centre)
+# or the subtitle band (lower third): top logos are capped at y<200, bottom logos start below y>1500.
+#   position: top_left | top_right | bottom_left | bottom_right
+#   width_pct: width as % of the 1080 px frame (3–30)
+#   show: always | first_3s | last_3s
+logos:
+  my_logo:
+    enabled: false
+    file: my_logo.png
+    position: bottom_right
+    width_pct: 12
+    opacity: 0.85
+    margin_px: 40
+    show: always
+  campaign_logo:
+    enabled: false
+    file: campaign_logo.png
+    position: top_left
+    width_pct: 12
+    opacity: 0.85
+    margin_px: 40
+    show: always

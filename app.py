@@ -96,7 +96,35 @@ def _frame(job: pl.Job | None, status: str, final: bool = False):
 # --------------------------------------------------------------------------- #
 # Process tab — generator keeps the HTTP request (and Cloud Run CPU) alive until the job ends
 # --------------------------------------------------------------------------- #
-def run_processing(url: str, video_file, cookies_file, mode: str):
+LOGO_DEFAULT = "(rules.yaml default)"
+LOGO_NONE = "(none)"
+
+
+def logo_choices() -> list[str]:
+    return [LOGO_DEFAULT, LOGO_NONE] + pl.list_saved_logos()
+
+
+def refresh_logo_lists():
+    ch = logo_choices()
+    return gr.Dropdown(choices=ch, value=LOGO_DEFAULT), gr.Dropdown(choices=ch, value=LOGO_DEFAULT)
+
+
+def _logo_override(upload, pick: str | None, slot: str) -> tuple[dict, str]:
+    """Return ({slot: name|None} or {}, note). Upload wins over the dropdown; uploads are kept in logos/."""
+    path = _file_path(upload)
+    if path:
+        name = pl.save_logo(path, Path(path).stem)
+        return {slot: name}, f"{slot}: uploaded → saved as `{name}`"
+    if pick == LOGO_NONE:
+        return {slot: None}, f"{slot}: off"
+    if pick and pick != LOGO_DEFAULT:
+        return {slot: pick}, f"{slot}: `{pick}`"
+    return {}, ""
+
+
+def run_processing(url: str, video_file, cookies_file, mode: str,
+                   my_logo_file=None, my_logo_pick: str | None = None,
+                   camp_logo_file=None, camp_logo_pick: str | None = None):
     global _current_job
     url = (url or "").strip()
     video_path = _file_path(video_file)
@@ -128,12 +156,24 @@ def run_processing(url: str, video_file, cookies_file, mode: str):
             dst = job_work / "cookies.txt"
             shutil.copy(cookies_path, dst)
             cookies_path = str(dst)
+        logo_overrides: dict = {}
+        notes = []
+        for upload, pick, slot in ((my_logo_file, my_logo_pick, "my_logo"), (camp_logo_file, camp_logo_pick, "campaign_logo")):
+            try:
+                ov, note = _logo_override(upload, pick, slot)
+            except Exception as e:
+                ov, note = {}, f"{slot}: could not store logo ({e})"
+            logo_overrides.update(ov)
+            if note:
+                notes.append(note)
+        if notes:
+            job.log("Logo selection: " + "; ".join(notes))
         _current_job = job
 
     # The worker thread does the work; this generator streams its log every second and only returns
     # when the job is finished, so the request stays open for Cloud Run.
     worker = pl.run_in_background(job, url=url, local_file=video_path, cookies_path=cookies_path,
-                                  mode=mode, rules=rules)
+                                  mode=mode, rules=rules, logo_overrides=logo_overrides)
     yield _frame(job, f"🚀 Started job {job.id}")
     last_len = -1
     while worker.is_alive():
@@ -269,6 +309,20 @@ with gr.Blocks(title="Clipper") as demo:
                     )
                     process_btn = gr.Button("▶️ Process", variant="primary", size="lg")
                     gr.Markdown("Keep this tab open while processing — the job runs inside this request.")
+            with gr.Accordion("Logos (PNG with transparency) — corners only, never over hook/subtitles", open=False):
+                gr.Markdown("Upload once and the file is kept in `logos/` (and the bucket) so you can pick it from the "
+                            "list next time. Position / size / timing come from the **Rules** tab (`logos:` section). "
+                            "An upload or a picked name enables the logo for this job even if `enabled: false`.")
+                _lc = logo_choices()
+                with gr.Row():
+                    with gr.Column():
+                        my_logo_pick = gr.Dropdown(choices=_lc, value=LOGO_DEFAULT, label="My logo (saved)")
+                        my_logo_file = gr.File(label="… or upload my logo", file_types=[".png", ".webp"], file_count="single")
+                    with gr.Column():
+                        camp_logo_pick = gr.Dropdown(choices=_lc, value=LOGO_DEFAULT, label="Campaign logo (saved)")
+                        camp_logo_file = gr.File(label="… or upload campaign logo", file_types=[".png", ".webp"], file_count="single")
+                logo_refresh = gr.Button("🔄 Refresh logo lists", size="sm")
+                logo_refresh.click(refresh_logo_lists, outputs=[my_logo_pick, camp_logo_pick])
             status_md = gr.Markdown("Idle")
             log_box = gr.Textbox(label="Progress log", lines=12, max_lines=20, interactive=False, autoscroll=True)
             with gr.Row():
@@ -288,8 +342,10 @@ with gr.Blocks(title="Clipper") as demo:
                             slot_components += [v, m, d]
 
             outputs = [log_box, status_md, zip_btn, captions_btn, links_md, *slot_components]
-            process_btn.click(run_processing, inputs=[url_in, video_in, cookies_in, mode_in], outputs=outputs,
-                              concurrency_limit=1, concurrency_id="process")
+            process_btn.click(run_processing,
+                              inputs=[url_in, video_in, cookies_in, mode_in,
+                                      my_logo_file, my_logo_pick, camp_logo_file, camp_logo_pick],
+                              outputs=outputs, concurrency_limit=1, concurrency_id="process")
 
         # ---------------- Rules ----------------
         with gr.Tab("Rules"):
@@ -321,6 +377,7 @@ with gr.Blocks(title="Clipper") as demo:
 
     demo.load(refresh_history, outputs=[hist_table, hist_pick])
     demo.load(attach_running, outputs=outputs)
+    demo.load(refresh_logo_lists, outputs=[my_logo_pick, camp_logo_pick])
 
 
 if __name__ == "__main__":
