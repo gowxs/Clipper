@@ -1,0 +1,16 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+.venv
+venv
+out
+work
+*.mp4
+*.mkv
+*.webm
+*.wav
+*.zip
+cookies.txt
+.env
+.gradio

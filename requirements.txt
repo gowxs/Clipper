@@ -1,0 +1,10 @@
+gradio>=6.0,<7
+yt-dlp>=2025.9.1
+faster-whisper>=1.1.1
+ctranslate2>=4.4
+av>=11,<15
+numpy>=1.26
+PyYAML>=6.0
+gdown>=5.2
+mediapipe>=0.10.14
+google-genai>=1.0

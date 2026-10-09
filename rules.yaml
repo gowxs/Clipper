@@ -1,0 +1,38 @@
+# Clipper rules — edit in the "Rules" tab or directly in this file.
+
+# Clip length bounds (seconds)
+min_len: 15
+max_len: 30
+
+# How many clips to produce per video (UI caps this at 8)
+clips_per_video: 4
+
+# Windows containing these words are penalised (case-insensitive)
+banned_words: []
+
+# Windows containing these words get a score boost (case-insensitive)
+keywords_boost: []
+
+# "text_overlay" draws the hook in the top third for the first 3 s, "none" disables it
+hook_style: text_overlay
+
+subtitle:
+  font: Montserrat-Bold
+  size: 72
+  color: "#FFFFFF"
+  highlight_color: "#FFD400"
+  position: lower_third      # lower_third | center | top
+  words_per_line: 3
+
+# Placeholders: {hook} {title} {hashtags} {start} {end}
+caption_template: |
+  {hook}
+
+  {title} #Ad
+
+  {hashtags}
+
+# Free-form notes used by the Gemini selector (ignored by the local selector)
+audience_notes: |
+  Short-form audience (TikTok / Reels / Shorts). Prefer moments with a strong
+  opening line, a clear point, humour or surprise. Avoid slow or context-dependent parts.
