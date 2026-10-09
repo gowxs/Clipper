@@ -41,28 +41,52 @@ deleted after every job. Only the last 20 jobs are kept in `out/`.
 | Secret | Required | Purpose |
 |---|---|---|
 | `PASSWORD` | **yes** | Login password for the UI (username is `admin`, override with a `USERNAME` variable) |
-| `GEMINI_API_KEY` | optional | Enables the **gemini** selector (gemini-2.5-flash picks the moments and writes hooks + captions). Without it only **local** is offered. |
+| `GEMINI_API_KEY` | optional | Enables the **gemini** selector (gemini-2.5-flash picks the moments and writes hooks + captions). Without it only **local** is offered. Accepts a Google AI Studio key **or** a Vertex AI express-mode key (starts with `AQ.`, auto-detected → Vertex AI endpoint). |
+| `GEMINI_USE_VERTEX` | optional (variable) | Force `true`/`false` if auto-detection of the key type is wrong. |
 | `WHISPER_MODEL` | optional (variable) | Defaults to `small`. `base` is ~2× faster, `medium` is more accurate but slow on CPU. |
 
 Secrets are read at runtime, so you can change them without rebuilding.
 
-## 3. Push the code with git
+## 3. Connect the Space to this GitHub repo (auto-deploy on every push to `main`)
+
+Development happens in this GitHub repo (`gowxs/Clipper`, branch `main`). Hugging Face Spaces have no
+built-in "sync with GitHub" switch, so the sync is done by the GitHub Actions workflow in
+`.github/workflows/sync-to-hf.yml`: every push to `main` is force-pushed to the Space's git repo, which
+triggers a rebuild.
+
+### 3a. One-time setup (recommended)
+
+1. Create a Hugging Face **write** token: <https://huggingface.co/settings/tokens> → *New token* →
+   type **Write** (or a fine-grained token with *Write access to contents/settings of all repos* scoped to the Space).
+2. In GitHub: **Settings → Secrets and variables → Actions**
+   - *Secrets* → **New repository secret**: name `HF_TOKEN`, value = the token.
+   - *Variables* → **New repository variable**: name `HF_SPACE_ID`, value = `<hf-username>/<space-name>`
+     (e.g. `gowxs/clipper`).
+3. Push anything to `main` (or run the workflow manually via **Actions → Sync to Hugging Face Space → Run workflow**).
+4. Watch the build in the Space's **Logs** tab. The first build takes ≈10 min (pip install + pre-downloading
+   the whisper model); later builds are cached and faster.
+
+The workflow is skipped automatically while `HF_SPACE_ID` is not set, so the repo works without a Space too.
+
+### 3b. Manual alternative (push from your machine)
 
 ```bash
-git clone https://github.com/gowxs/Clipper.git   # or your copy of this repo
+git clone https://github.com/gowxs/Clipper.git
 cd Clipper
 
-# add the Space as a second remote (replace <user>)
-git remote add space https://huggingface.co/spaces/<user>/clipper
-git push space main
+# add the Space as a second remote (replace <user>/<space>)
+git remote add hf https://huggingface.co/spaces/<user>/<space>
+git push --force hf main          # username: your HF user, password: a WRITE token
 ```
 
-Hugging Face asks for your HF username and a **write access token** (<https://huggingface.co/settings/tokens>)
-as the password. The Space builds the Docker image (≈10 min the first time: it pre-downloads the whisper
-model) and then shows the login screen. Every later `git push space main` rebuilds and redeploys.
+Repeat `git push hf main` after every change you also pushed to GitHub. To avoid typing the token, use
+`https://<user>:<HF_TOKEN>@huggingface.co/spaces/<user>/<space>` as the remote URL (keep it out of the repo).
 
+> If you created the Space with a README of its own, the first push is rejected with *non-fast-forward*;
+> `--force` replaces the Space's history with this repo's, which is what you want.
+>
 > `fonts/Montserrat-Bold.ttf` (OFL) and `models/blaze_face_short_range.tflite` are committed so the build
-> does not depend on external downloads for them.
+> does not depend on external downloads for them. Both are < 1 MB, so no Git LFS is needed.
 
 ## 4. Use it
 
@@ -134,6 +158,10 @@ $ ls out/20261009-193905-5900ed
 captions.md  clip_01.mp4  clip_02.mp4  clip_03.mp4  clip_04.mp4  clips.zip
 ```
 
+Same video with `--mode gemini` (Vertex AI express key): Gemini picked 4 non-overlapping windows
+(5.9–28.2 s, 35.0–60.0 s, 60.1–75.7 s, 111.4–128.9 s) and wrote hooks such as *"Free video clipper? No GPU!"*
+plus hashtagged captions; the whole job took 1.8 min.
+
 Each clip: `h264 1080x1920 30 fps`, integrated loudness ≈ −14.5 LUFS. On the free 2 vCPU Space expect
 roughly 1× real time for transcription of the source plus ~10–20 s of rendering per clip.
 
@@ -147,6 +175,7 @@ pipeline.py       download → transcribe → select → render → zip (also a 
 rules.yaml        editable rules (see the Rules tab)
 requirements.txt  Python deps
 Dockerfile        python:3.11-slim + ffmpeg + fonts + deno + pre-downloaded whisper model
+.github/workflows/sync-to-hf.yml   pushes main to the HF Space (needs HF_TOKEN secret + HF_SPACE_ID variable)
 fonts/            Montserrat-Bold.ttf (SIL OFL)
 models/           mediapipe BlazeFace short-range model (Apache-2.0)
 out/              results (created at runtime)

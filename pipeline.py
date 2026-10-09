@@ -569,11 +569,27 @@ def attach_clip_words(clip: dict, words: list[Word]):
     clip["text"] = " ".join(w.text for w in clip["words"])
 
 
-def select_moments_gemini(words: list[Word], segments: list[dict], rules: dict, total_dur: float,
-                          title: str, job: Job) -> list[dict]:
+def use_vertex(api_key: str) -> bool:
+    """Vertex AI express-mode keys start with 'AQ.'; GEMINI_USE_VERTEX=1 forces it."""
+    flag = os.environ.get("GEMINI_USE_VERTEX", "").strip().lower()
+    if flag in ("1", "true", "yes"):
+        return True
+    if flag in ("0", "false", "no"):
+        return False
+    return api_key.startswith("AQ.")
+
+
+def make_genai_client(api_key: str):
     from google import genai
 
-    api_key = os.environ.get("GEMINI_API_KEY")
+    if use_vertex(api_key):
+        return genai.Client(vertexai=True, api_key=api_key)
+    return genai.Client(api_key=api_key)
+
+
+def select_moments_gemini(words: list[Word], segments: list[dict], rules: dict, total_dur: float,
+                          title: str, job: Job) -> list[dict]:
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set")
     n_clips = int(rules["clips_per_video"])
@@ -607,8 +623,8 @@ Return ONLY a JSON array like:
 Transcript:
 {transcript}
 """
-    client = genai.Client(api_key=api_key)
-    job.log("Asking gemini-2.5-flash to pick the best moments ...")
+    client = make_genai_client(api_key)
+    job.log(f"Asking gemini-2.5-flash ({'Vertex AI' if use_vertex(api_key) else 'Gemini API'}) to pick the best moments ...")
     resp = client.models.generate_content(
         model="gemini-2.5-flash",
         contents=prompt,
