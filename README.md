@@ -161,18 +161,29 @@ The workflow is skipped while `GCP_PROJECT_ID` is unset, so the repo also works 
 
 ---
 
-## 3. Using the app
+## 3. Using the app (mobile-first)
 
-- **Process**: paste a link (YouTube / Kick / Google Drive / `gs://bucket/file.mp4`) *or* upload a file,
-  optionally add `cookies.txt`, pick `local`/`gemini`, press **Process**. The log streams live. When done you
-  get previews, per-clip downloads, **Download all (zip)**, `captions.md` and (with a bucket) signed Cloud
-  Storage links.
-  **Keep the tab open** — the job runs inside that request (closing the tab lets Cloud Run throttle the CPU
-  and the job crawls).
-- **Rules**: edit `rules.yaml` and **Save** (validated). Applies to the next job. Edits live on the instance's
-  disk; commit the file to make them permanent across deploys.
-- **History**: last 20 jobs; ☁️ entries have signed links to `clips.zip`/`captions.md` in the bucket, 💾
-  entries exist only while the instance lives.
+The main tab is one vertical flow, in Latvian by default (switch to English under *Iestatījumi → Valoda*):
+
+1. **Video** — paste a link (YouTube / Kick / Google Drive / `gs://`) *or* upload a file.
+2. **Kampaņa** — pick a saved campaign profile (campaign logo, hashtags, caption template, number of clips,
+   keywords to boost). **+ Jauna kampaņa** opens a small form; profiles live in `campaigns.yaml`
+   (mirrored to the bucket under `clipper/config/` when `GCS_BUCKET` is set).
+3. **Veidot klipus** — one big button. Keep the tab open: the job runs inside that request.
+
+Progress is one human-readable line ("Transkribē runu… 32 %", "Veido klipu 2/4…") plus a bar; the raw log is
+under *Rādīt detaļas*. Errors are translated into plain language (e.g. "YouTube bloķē lejupielādi — pievieno
+cookies.txt vai augšupielādē failu"). Results are cards: preview, **Lejupielādēt**, caption with a copy button,
+and **Lejupielādēt visus (zip)** above them (plus signed Cloud Storage links when a bucket is configured).
+
+*Papildu* (collapsed) holds cookies.txt, local/gemini, the whisper model and the clip-length preset.
+
+**Iestatījumi**: language, *my logo* (global, every clip), subtitle style (size, colours, position, words per
+line, hook on/off). The raw `rules.yaml` editor is hidden behind the *Eksperts* switch.
+Settings are written to `rules.yaml` / `settings.yaml` and mirrored to the bucket.
+
+**Vēsture**: last 20 jobs — date, campaign, four thumbnails, zip button (local file while the instance lives,
+signed URL from the bucket afterwards).
 
 ### Logos
 
@@ -281,7 +292,10 @@ key) Gemini picked 4 windows and wrote hooks such as *"Free video clipper? No GP
 ## Files
 
 ```
-app.py            Gradio UI (Process / Rules / History); job streams inside the request
+app.py            mobile-first Gradio UI (Klipi / Iestatījumi / Vēsture); job streams inside the request
+i18n.py           LV/EN strings, human-readable errors and progress stages
+store.py          campaigns.yaml / settings.yaml / rules.yaml with GCS mirror
+campaigns.yaml    saved campaign profiles (created by the UI; git-ignored)
 pipeline.py       download → transcribe → select → render → zip (+ GCS upload); also a CLI
 gcs.py            optional Cloud Storage persistence + signed URLs
 rules.yaml        editable rules (whisper_model, max_video_minutes, lengths, subtitles, caption template …)

@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -225,6 +226,8 @@ class Job:
     captions_path: Optional[str] = None
     error: Optional[str] = None
     gcs: dict = field(default_factory=dict)
+    stage: Optional[tuple] = None          # (i18n key, params) for the human-readable progress line
+    campaign: str = ""
     started_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -236,6 +239,12 @@ class Job:
             if progress is not None:
                 self.progress = max(self.progress, float(progress))
         print(line, flush=True)
+
+    def set_stage(self, key: str, progress: Optional[float] = None, **params):
+        with self._lock:
+            self.stage = (key, params)
+            if progress is not None:
+                self.progress = max(self.progress, float(progress))
 
     @property
     def log_text(self) -> str:
@@ -386,7 +395,7 @@ def download_source(url: str, workdir: Path, cookies: Optional[str], job: Job) -
     # yt-dlp (YouTube, Kick, ...)
     out_tmpl = str(workdir / "source.%(ext)s")
     cmd = [
-        "yt-dlp",
+        sys.executable, "-m", "yt_dlp",
         "--no-playlist",
         "--no-warnings",
         "-f", "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/b",
@@ -402,6 +411,7 @@ def download_source(url: str, workdir: Path, cookies: Optional[str], job: Job) -
     if cookies:
         cmd += ["--cookies", cookies]
     cmd.append(url)
+    job.set_stage("st_download")
     job.log(f"Downloading with yt-dlp (<=1080p){' + cookies' if cookies else ''} ...")
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     last = ""
@@ -434,6 +444,7 @@ def limit_duration(src: str, workdir: Path, job: Job, max_minutes: float = DEFAU
     info = probe_video(src)
     max_seconds = float(max_minutes) * 60
     if info["duration"] > max_seconds + 1:
+        job.set_stage("st_trim")
         job.log(f"Source is {info['duration']/60:.1f} min — trimming to the first {max_minutes:g} min.")
         trimmed = str(workdir / "source_trimmed.mp4")
         run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-t", str(max_seconds),
@@ -483,6 +494,7 @@ def transcribe(wav_path: str, job: Job, total_dur: float,
                model_name: str = DEFAULT_WHISPER_MODEL) -> tuple[list[Word], list[dict], str]:
     """Return (words, segments, language)."""
     model = get_whisper(model_name)
+    job.set_stage("st_transcribe", pct=0)
     job.log(f"Transcribing with faster-whisper '{model_name}' (int8, CPU, VAD) ...")
     # decode with ffmpeg (already done) and hand whisper a float32 array -> no PyAV version issues
     audio = load_wav_mono16k(wav_path)
@@ -511,7 +523,8 @@ def transcribe(wav_path: str, job: Job, total_dur: float,
                          "words": seg_words})
         if time.time() - last_report > 5:
             frac = min(0.99, float(seg.end) / max(total_dur, 1.0))
-            job.log(f"  transcribed {seg.end/60:.1f}/{total_dur/60:.1f} min", progress=0.15 + 0.35 * frac)
+            job.set_stage("st_transcribe", progress=0.15 + 0.35 * frac, pct=int(frac * 100))
+            job.log(f"  transcribed {seg.end/60:.1f}/{total_dur/60:.1f} min")
             last_report = time.time()
     job.log(f"Transcription done: {len(words)} words, language={info.language}", progress=0.5)
     return words, segments, info.language or "en"
@@ -747,6 +760,7 @@ Transcript:
 {transcript}
 """
     client = make_genai_client(api_key)
+    job.set_stage("st_select", progress=0.5)
     job.log(f"Asking gemini-2.5-flash ({'Vertex AI' if use_vertex(api_key) else 'Gemini API'}) to pick the best moments ...")
     resp = client.models.generate_content(
         model="gemini-2.5-flash",
@@ -1191,9 +1205,17 @@ def default_hashtags(title: str, text: str) -> str:
     return " ".join(dict.fromkeys(tags))
 
 
-def fill_caption(template: str, clip: dict, title: str) -> str:
+def make_thumbnail(video: str, out_jpg: str, t: float = 1.0):
+    try:
+        run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t:.2f}", "-i", video, "-frames:v", "1",
+             "-vf", "scale=270:-2", "-q:v", "5", out_jpg], timeout=60)
+    except Exception as e:  # noqa: BLE001
+        print(f"[thumb] failed: {e}", flush=True)
+
+
+def fill_caption(template: str, clip: dict, title: str, hashtags: Optional[str] = None) -> str:
     cap = clip.get("caption") or ""
-    hashtags = default_hashtags(title, clip.get("text", ""))
+    hashtags = (hashtags or "").strip() or default_hashtags(title, clip.get("text", ""))
     if cap:
         # Gemini wrote the caption: template still wraps it so #Ad is always present
         body = template.format(hook=cap, title=title, hashtags=hashtags if "#" not in cap else "",
@@ -1290,6 +1312,7 @@ def process(job: Job, url: str = "", local_file: Optional[str] = None, cookies_p
         if local_file:
             src = local_file
             title = Path(local_file).stem
+            job.set_stage("st_upload_src")
             job.log(f"Using uploaded file: {Path(local_file).name}")
         elif url.strip():
             src, title = download_source(url, workdir, cookies_path, job)
@@ -1303,11 +1326,13 @@ def process(job: Job, url: str = "", local_file: Optional[str] = None, cookies_p
 
         # 2) transcription
         wav = str(workdir / "audio.wav")
+        job.set_stage("st_audio", progress=0.12)
         extract_audio(src, wav)
         job.log("Audio extracted", progress=0.15)
         words, segments, lang = transcribe(wav, job, info["duration"], str(rules.get("whisper_model", DEFAULT_WHISPER_MODEL)))
 
         # 3) selection
+        job.set_stage("st_select", progress=0.5)
         rms, hop = audio_rms_curve(wav)
         clips: list[dict] = []
         if mode == "gemini":
@@ -1331,16 +1356,22 @@ def process(job: Job, url: str = "", local_file: Optional[str] = None, cookies_p
             if info["width"] / info["height"] > 9 / 16:
                 face_cx = detect_face_center(src, clip["start"], clip["end"], workdir)
                 job.log(f"  clip {i}: face {'found at x=%.2f' % face_cx if face_cx is not None else 'not found, centre crop'}")
+            job.set_stage("st_render", i=i, n=len(clips))
             ass_path = str(workdir / f"clip_{i:02d}.ass")
             build_ass(clip, rules, ass_path, clip.get("hook", ""))
             job.log(f"  rendering {name} ({clip['start']:.1f}-{clip['end']:.1f}s) ...")
             render_clip(src, clip, ass_path, str(out_path), info, face_cx, job, logos)
             clip["file"] = str(out_path)
-            clip["caption_text"] = fill_caption(rules["caption_template"], clip, title)
+            clip["caption_text"] = fill_caption(rules["caption_template"], clip, title,
+                                                hashtags=rules.get("hashtags") or None)
+            thumb = out_dir / f"thumb_{i:02d}.jpg"
+            make_thumbnail(str(out_path), str(thumb))
+            clip["thumb"] = str(thumb) if thumb.exists() else None
             rendered.append(out_path)
             job.clips.append({
                 "file": str(out_path), "start": clip["start"], "end": clip["end"],
                 "hook": clip.get("hook", ""), "caption": clip["caption_text"], "text": clip.get("text", ""),
+                "thumb": clip.get("thumb"),
             })
             job.log(f"  done {name}", progress=0.55 + 0.4 * i / len(clips))
 
@@ -1354,28 +1385,33 @@ def process(job: Job, url: str = "", local_file: Optional[str] = None, cookies_p
 
         if gcs.enabled():
             try:
-                job.log(f"Uploading clips.zip + captions.md to gs://{gcs.BUCKET}/{gcs.job_prefix(job.id)}/ ...",
-                        progress=0.97)
+                job.set_stage("st_uploadgcs", progress=0.97)
+                job.log(f"Uploading clips.zip + captions.md to gs://{gcs.BUCKET}/{gcs.job_prefix(job.id)}/ ...")
                 gcs_uris["zip"] = gcs.upload_file(zp, job.id) or ""
                 gcs_uris["captions"] = gcs.upload_file(captions, job.id) or ""
+                for c in job.clips:
+                    if c.get("thumb"):
+                        gcs.upload_file(c["thumb"], job.id, content_type="image/jpeg")
                 job.gcs = gcs_uris
             except Exception as e:
                 job.log(f"GCS upload failed ({e}) — results are only on local disk.")
         job.status = "done"
         job.finished_at = time.time()
-        job.log(f"Finished: {len(rendered)} clips in {out_dir} ({(job.finished_at - job.started_at)/60:.1f} min)",
-                progress=1.0)
+        job.set_stage("st_done", progress=1.0)
+        job.log(f"Finished: {len(rendered)} clips in {out_dir} ({(job.finished_at - job.started_at)/60:.1f} min)")
         append_history({
-            "id": job.id, "title": title, "source": job.source, "mode": mode,
+            "id": job.id, "title": title, "source": job.source, "mode": mode, "campaign": job.campaign,
             "finished": time.strftime("%Y-%m-%d %H:%M"),
             "clips": [{"file": Path(c["file"]).name, "start": c["start"], "end": c["end"], "hook": c["hook"],
-                       "caption": c["caption"]} for c in job.clips],
+                       "caption": c["caption"], "thumb": Path(c["thumb"]).name if c.get("thumb") else None}
+                      for c in job.clips],
             "zip": zp.name, "captions": captions.name, "gcs": gcs_uris,
         })
     except Exception as e:
         job.status = "error"
         job.error = str(e)
         job.finished_at = time.time()
+        job.set_stage("st_error")
         job.log(f"ERROR: {e}")
         shutil.rmtree(out_dir, ignore_errors=True)
     finally:

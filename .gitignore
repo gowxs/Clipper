@@ -12,3 +12,5 @@ work/
 cookies.txt
 .env
 .gradio/
+campaigns.yaml
+settings.yaml

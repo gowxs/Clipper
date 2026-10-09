@@ -124,6 +124,13 @@ def read_text(name: str) -> Optional[str]:
         return None
 
 
+def write_text(name: str, text: str, content_type: str = "text/plain; charset=utf-8") -> bool:
+    if not enabled():
+        return False
+    _bucket().blob(name).upload_from_string(text, content_type=content_type, timeout=60)
+    return True
+
+
 # --------------------------------------------------------------------------- #
 # signed URLs
 # --------------------------------------------------------------------------- #
