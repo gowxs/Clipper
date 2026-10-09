@@ -1,128 +1,226 @@
----
-title: Clipper
-emoji: ✂️
-colorFrom: yellow
-colorTo: blue
-sdk: docker
-app_port: 7860
-pinned: false
----
-
 # ✂️ Clipper
 
-Single-user, CPU-only clipping tool: paste a YouTube / Kick / Google Drive link (or upload a file) and get
-N vertical 1080×1920 clips with karaoke subtitles, a hook overlay, normalised audio, captions and a zip.
-Built for a **free Hugging Face Docker Space** (2 vCPU, 16 GB RAM, no GPU).
+Single-user, CPU-only clipping tool: paste a YouTube / Kick / Google Drive link, a `gs://` path, or upload a
+file, and get N vertical 1080×1920 clips with karaoke subtitles, a hook overlay, normalised audio, captions and
+a zip. Deployed to **Google Cloud Run** (2 vCPU / 4 GiB, scale-to-zero) from this GitHub repo on every push
+to `main`. Designed for a tiny budget: nothing is billed while idle.
 
 | Stage | Tool |
 |---|---|
-| Download | `yt-dlp` (≤1080p mp4, optional `cookies.txt`), `gdown` for Google Drive, or direct upload |
-| Transcription | `faster-whisper` "small", int8, CPU, VAD filter, word timestamps |
-| Moment selection | **local** heuristic (speech density + RMS peaks + keywords + ?/! − banned words) or **gemini-2.5-flash** |
+| Download | `yt-dlp` (≤1080p mp4, optional `cookies.txt`), `gdown` for Google Drive, `gs://` from Cloud Storage, or upload |
+| Transcription | `faster-whisper` `base` (default) or `small`, int8, CPU, VAD filter, word timestamps |
+| Moment selection | **local** heuristic (speech density + RMS peaks + keywords + ?/! − banned words) or **gemini-2.5-flash** (Google AI or Vertex AI express key) |
 | Render | `ffmpeg`: 9:16 crop (mediapipe face-centred), ASS karaoke subtitles, hook text (first 3 s), `loudnorm` −14 LUFS, h264 veryfast CRF 23 |
-| Output | `out/<id>/clip_01..N.mp4`, `captions.md`, `clips.zip` |
+| Output | `out/<id>/clip_01..N.mp4`, `captions.md`, `clips.zip` → `clips.zip` + `captions.md` copied to the GCS bucket |
 
-Long sources are trimmed to the first 90 minutes. Intermediate files (downloads, wav, frames, .ass) are
-deleted after every job. Only the last 20 jobs are kept in `out/`.
+Sources longer than `max_video_minutes` (default 60) are trimmed. Intermediate files are deleted after every
+job; only the last 20 jobs are kept (locally and in the bucket).
 
 ---
 
-## 1. Create the Hugging Face Space
+## 1. Google Cloud setup (one time, ≈15 min)
 
-1. Go to <https://huggingface.co/new-space>.
-2. **Space name:** `clipper` (anything you like). **License:** your choice.
-3. **SDK:** **Docker** → template **Blank**.
-4. **Hardware:** *CPU basic · 2 vCPU · 16 GB* (free).
-5. Visibility: **Private** is recommended (the app also has its own password, see below).
-6. Click **Create Space**.
+Use the **same GCP project** that owns the Vertex AI key. Replace `PROJECT_ID`, `BUCKET` below.
 
-## 2. Add Secrets (Settings → Variables and secrets)
+### 1.1 Enable APIs
 
-| Secret | Required | Purpose |
-|---|---|---|
-| `PASSWORD` | **yes** | Login password for the UI (username is `admin`, override with a `USERNAME` variable) |
-| `GEMINI_API_KEY` | optional | Enables the **gemini** selector (gemini-2.5-flash picks the moments and writes hooks + captions). Without it only **local** is offered. Accepts a Google AI Studio key **or** a Vertex AI express-mode key (starts with `AQ.`, auto-detected → Vertex AI endpoint). |
-| `GEMINI_USE_VERTEX` | optional (variable) | Force `true`/`false` if auto-detection of the key type is wrong. |
-| `WHISPER_MODEL` | optional (variable) | Defaults to `small`. `base` is ~2× faster, `medium` is more accurate but slow on CPU. |
-
-Secrets are read at runtime, so you can change them without rebuilding.
-
-## 3. Connect the Space to this GitHub repo (auto-deploy on every push to `main`)
-
-Development happens in this GitHub repo (`gowxs/Clipper`, branch `main`). Hugging Face Spaces have no
-built-in "sync with GitHub" switch, so the sync is done by the GitHub Actions workflow in
-`.github/workflows/sync-to-hf.yml`: every push to `main` is force-pushed to the Space's git repo, which
-triggers a rebuild.
-
-### 3a. One-time setup (recommended)
-
-1. Create a Hugging Face **write** token: <https://huggingface.co/settings/tokens> → *New token* →
-   type **Write** (or a fine-grained token with *Write access to contents/settings of all repos* scoped to the Space).
-2. In GitHub: **Settings → Secrets and variables → Actions**
-   - *Secrets* → **New repository secret**: name `HF_TOKEN`, value = the token.
-   - *Variables* → **New repository variable**: name `HF_SPACE_ID`, value = `<hf-username>/<space-name>`
-     (e.g. `gowxs/clipper`).
-3. Push anything to `main` (or run the workflow manually via **Actions → Sync to Hugging Face Space → Run workflow**).
-4. Watch the build in the Space's **Logs** tab. The first build takes ≈10 min (pip install + pre-downloading
-   the whisper model); later builds are cached and faster.
-
-The workflow is skipped automatically while `HF_SPACE_ID` is not set, so the repo works without a Space too.
-
-### 3b. Manual alternative (push from your machine)
+Console: *APIs & Services → Enable APIs* → enable **Cloud Run Admin API**, **Cloud Build API**,
+**Artifact Registry API**, **Cloud Storage API**. Or with `gcloud`:
 
 ```bash
-git clone https://github.com/gowxs/Clipper.git
-cd Clipper
-
-# add the Space as a second remote (replace <user>/<space>)
-git remote add hf https://huggingface.co/spaces/<user>/<space>
-git push --force hf main          # username: your HF user, password: a WRITE token
+gcloud config set project PROJECT_ID
+gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
+    artifactregistry.googleapis.com storage.googleapis.com iam.googleapis.com
 ```
 
-Repeat `git push hf main` after every change you also pushed to GitHub. To avoid typing the token, use
-`https://<user>:<HF_TOKEN>@huggingface.co/spaces/<user>/<space>` as the remote URL (keep it out of the repo).
+### 1.2 Service account for GitHub Actions (deployer)
 
-> If you created the Space with a README of its own, the first push is rejected with *non-fast-forward*;
-> `--force` replaces the Space's history with this repo's, which is what you want.
->
-> `fonts/Montserrat-Bold.ttf` (OFL) and `models/blaze_face_short_range.tflite` are committed so the build
-> does not depend on external downloads for them. Both are < 1 MB, so no Git LFS is needed.
+Console: *IAM & Admin → Service Accounts → Create* → name `github-deployer`, then grant these roles:
 
-## 4. Use it
+| Role | Why |
+|---|---|
+| Cloud Run Admin | `gcloud run deploy` |
+| Cloud Build Editor | `--source .` builds the image with Cloud Build |
+| Artifact Registry Writer | push the built image |
+| Service Account User | deploy a service that runs as the runtime SA |
+| Storage Object Admin | Cloud Build uploads the source tarball; also lets the deployer manage the clips bucket |
 
-- **Process** tab: paste a link *or* upload a video, optionally upload `cookies.txt`, pick `local`/`gemini`,
-  press **Process**. The log updates live; when done you get previews, per-clip download buttons,
-  **Download all (zip)** and `captions.md`.
-- **Rules** tab: edit `rules.yaml` (lengths, clip count, banned/boost words, hook style, subtitle font/size/
-  colours/position/words per line, caption template with `#Ad`, audience notes) and **Save**. Applies to the next job.
-- **History** tab: last 20 jobs with their clips and zip.
+Same with `gcloud`:
+
+```bash
+SA=github-deployer@PROJECT_ID.iam.gserviceaccount.com
+gcloud iam service-accounts create github-deployer --display-name "GitHub deployer"
+for r in roles/run.admin roles/cloudbuild.builds.editor roles/artifactregistry.writer \
+         roles/iam.serviceAccountUser roles/storage.objectAdmin; do
+  gcloud projects add-iam-policy-binding PROJECT_ID --member "serviceAccount:$SA" --role "$r" --quiet
+done
+# JSON key → GitHub secret GCP_SA_KEY
+gcloud iam service-accounts keys create gcp-sa-key.json --iam-account "$SA"
+```
+
+### 1.3 Runtime permissions (the Cloud Run service itself)
+
+By default Cloud Run runs as the **Compute Engine default service account**
+(`PROJECT_NUMBER-compute@developer.gserviceaccount.com`). It needs:
+
+| Role | Why |
+|---|---|
+| Storage Object Admin (on the bucket) | upload `clips.zip` / `captions.md` / `history.json`, delete old jobs |
+| Service Account Token Creator (on itself) | sign download URLs (IAM `signBlob`) — without it links fall back to local downloads |
+
+```bash
+PN=$(gcloud projects describe PROJECT_ID --format 'value(projectNumber)')
+RT=$PN-compute@developer.gserviceaccount.com
+gcloud storage buckets add-iam-policy-binding gs://BUCKET --member "serviceAccount:$RT" --role roles/storage.objectAdmin
+gcloud iam service-accounts add-iam-policy-binding "$RT" --member "serviceAccount:$RT" --role roles/iam.serviceAccountTokenCreator
+```
+
+(Optionally create a dedicated runtime SA with just these roles and set the GitHub variable `CLOUD_RUN_SA` to its e-mail;
+the deployer then also needs *Service Account User* on it.)
+
+### 1.4 Bucket for results
+
+```bash
+gcloud storage buckets create gs://BUCKET --location europe-west1 --uniform-bucket-level-access
+# auto-delete objects after 30 days (keeps storage cost ≈ 0)
+cat > lifecycle.json <<'EOF'
+{"rule":[{"action":{"type":"Delete"},"condition":{"age":30}}]}
+EOF
+gcloud storage buckets update gs://BUCKET --lifecycle-file=lifecycle.json
+```
+
+Keep the bucket **private**. Downloads use short-lived signed URLs (2 h by default, `GCS_SIGNED_URL_MINUTES`).
+
+### 1.5 Budget alert
+
+Console: *Billing → Budgets & alerts → Create budget* → scope: this project → amount **€5** →
+thresholds 50 % / 90 % / 100 % → e-mail alerts. (A budget alert only notifies; to hard-stop spending you would
+also need a Cloud Function that disables billing — overkill at this scale.)
+
+### 1.6 Keep the image registry small (optional)
+
+Cloud Run `--source` stores images in Artifact Registry repo `cloud-run-source-deploy`. The image is ≈3.5 GB,
+so add a cleanup policy that keeps only the 2 newest versions:
+
+```bash
+cat > policy.json <<'EOF'
+[{"name":"keep-2","action":{"type":"Keep"},"mostRecentVersions":{"keepCount":2}},
+ {"name":"delete-rest","action":{"type":"Delete"},"condition":{"olderThan":"1d"}}]
+EOF
+gcloud artifacts repositories set-cleanup-policies cloud-run-source-deploy \
+    --location europe-west1 --policy policy.json --no-dry-run
+```
+
+---
+
+## 2. GitHub → Cloud Run (auto-deploy on every push to `main`)
+
+The workflow `.github/workflows/deploy-cloudrun.yml` authenticates with `google-github-actions/auth`
+and runs
+
+```
+gcloud run deploy clipper --source . --region europe-west1 --cpu 2 --memory 4Gi --timeout 3600 \
+  --min-instances 0 --max-instances 1 --concurrency 4 --allow-unauthenticated --env-vars-file env.yaml
+```
+
+(CPU is throttled outside requests — that is the cheap default; the app is built so all work happens inside
+the request, see §4.)
+
+Configure the repo: **Settings → Secrets and variables → Actions**
+
+| Kind | Name | Value |
+|---|---|---|
+| Secret | `GCP_SA_KEY` | contents of `gcp-sa-key.json` (§1.2) |
+| Secret | `PASSWORD` | UI login password (username `admin`) |
+| Secret | `GEMINI_API_KEY` | optional — Google AI Studio key **or** Vertex AI express key (`AQ.…`, auto-detected) |
+| Variable | `GCP_PROJECT_ID` | your project id |
+| Variable | `GCS_BUCKET` | `BUCKET` from §1.4 (leave empty → local disk only) |
+| Variable | `GCP_REGION` | optional, default `europe-west1` |
+| Variable | `CLOUD_RUN_SA` | optional runtime service-account e-mail |
+
+Then push to `main` (or *Actions → Deploy to Cloud Run → Run workflow*). The first build takes ≈10–15 min
+(pip install + baking the whisper models into the image); later builds reuse layers. The service URL is
+printed at the end of the job and in *Cloud Run → clipper*.
+
+The workflow is skipped while `GCP_PROJECT_ID` is unset, so the repo also works without GCP.
+
+**Rotate the Vertex key** if it was ever shared in chat/e-mail: *Google Cloud → APIs & Services → Credentials*.
+
+---
+
+## 3. Using the app
+
+- **Process**: paste a link (YouTube / Kick / Google Drive / `gs://bucket/file.mp4`) *or* upload a file,
+  optionally add `cookies.txt`, pick `local`/`gemini`, press **Process**. The log streams live. When done you
+  get previews, per-clip downloads, **Download all (zip)**, `captions.md` and (with a bucket) signed Cloud
+  Storage links.
+  **Keep the tab open** — the job runs inside that request (closing the tab lets Cloud Run throttle the CPU
+  and the job crawls).
+- **Rules**: edit `rules.yaml` and **Save** (validated). Applies to the next job. Edits live on the instance's
+  disk; commit the file to make them permanent across deploys.
+- **History**: last 20 jobs; ☁️ entries have signed links to `clips.zip`/`captions.md` in the bucket, 💾
+  entries exist only while the instance lives.
+
+### Uploads on Cloud Run
+
+Cloud Run rejects HTTP/1 request bodies above 32 MiB, so the upload field is limited to 30 MB there.
+For bigger sources use a link, or put the file in the bucket and paste its `gs://` path:
+
+```bash
+gcloud storage cp my_video.mp4 gs://BUCKET/uploads/
+# then paste  gs://BUCKET/uploads/my_video.mp4
+```
 
 ### YouTube "Sign in to confirm you're not a bot"
 
-Data-centre IPs (including HF Spaces) are often blocked by YouTube. Export your cookies with a browser
-extension such as *Get cookies.txt LOCALLY* (Netscape format) while logged in, and upload the file in the
-**cookies.txt** field. Prefer a throw-away Google account. Kick and Google Drive links usually work without cookies.
-
-### Google Drive
-
-Share the file as *Anyone with the link → Viewer* and paste the `https://drive.google.com/file/d/<id>/view` link.
+Cloud IPs are often blocked by YouTube. Export cookies with a browser extension such as
+*Get cookies.txt LOCALLY* (Netscape format) while logged in with a throw-away account and upload the file.
+Kick, Google Drive and `gs://` sources need no cookies.
 
 ---
 
-## 5. Test locally with Docker
+## 4. Cost model (why this stays within €10)
+
+Cloud Run is billed **only while a request is being served** (`--min-instances 0`, CPU throttled when idle),
+so idle cost is €0. Prices below are Cloud Run tier-1 (`europe-west1`) list prices; the free tier
+(180 000 vCPU-s + 360 000 GiB-s per month) is not even subtracted.
+
+| Item | Rate | Per job (20-min source, `base`, 4 clips ≈ 8 min of request) | Per job (60-min source, `base` ≈ 25 min) |
+|---|---|---|---|
+| vCPU 2 × $0.000024/s | | $0.023 | $0.072 |
+| Memory 4 GiB × $0.0000025/s | | $0.005 | $0.015 |
+| Gemini 2.5 Flash (Vertex) | $0.30 / M input tokens | < $0.01 | < $0.01 |
+| Cloud Storage (zip ≈ 60–150 MB, 30-day lifecycle) | $0.02 / GB·month | < $0.01 | < $0.01 |
+| Download egress | $0.12 / GB | ≈ $0.01 | ≈ $0.02 |
+| **≈ total** | | **≈ €0.04** | **≈ €0.10** |
+
+Fixed: Artifact Registry ≈ €0.30/month for the image (with the keep-2 policy), Cloud Build free tier covers
+the builds (≈10 min each). Realistic monthly total for 20–40 videos: **€1–3**. Using `whisper_model: small`
+roughly triples transcription time (and cost); `max_video_minutes` caps the worst case.
+
+Why the job runs inside the request: with the default (cheaper) CPU throttling, Cloud Run gives the container
+full CPU only while an HTTP request is open. The **Process** click is a Gradio generator that streams the log
+over SSE for the whole job, so the CPU stays allocated without paying for `--no-cpu-throttling`
+(which would bill 2 vCPU 24/7 ≈ €120/month).
+
+---
+
+## 5. Test locally
+
+### Docker (same image as Cloud Run)
 
 ```bash
 docker build -t clipper .
 
-docker run --rm -p 7860:7860 \
+docker run --rm -p 8080:8080 \
   -e PASSWORD=test123 \
-  -e GEMINI_API_KEY=...   # optional
+  -e GEMINI_API_KEY=...            # optional
+  -e GCS_BUCKET=BUCKET -e GOOGLE_APPLICATION_CREDENTIALS=/key.json -v "$PWD/gcp-sa-key.json:/key.json:ro" \  # optional
   -v "$PWD/out:/home/user/app/out" \
   clipper
 ```
 
-Open <http://localhost:7860>, log in with `admin` / `test123`, upload a short video with speech and press
-**Process**. Clips appear in `./out/<job-id>/`.
+Open <http://localhost:8080>, log in with `admin` / `test123`, upload a short video with speech and press **Process**.
 
 ### Without Docker (venv)
 
@@ -130,61 +228,45 @@ Open <http://localhost:7860>, log in with `admin` / `test123`, upload a short vi
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 # ffmpeg must be on PATH; deno or node is needed for YouTube downloads
-
-# UI
-PASSWORD=test123 python app.py
-
-# or the CLI (same pipeline, prints JSON with the produced clips)
-python pipeline.py path/to/video.mp4
+PASSWORD=test123 python app.py                 # UI on http://localhost:7860
+python pipeline.py path/to/video.mp4           # CLI, prints JSON with the produced clips
 python pipeline.py "https://www.youtube.com/watch?v=..." --cookies cookies.txt --mode gemini
 ```
 
-### Local test run (what to expect)
-
-A 2.9-minute 720p test video with synthetic speech, default rules (4 clips, 15–30 s), on 4 CPU threads:
+### What to expect (measured on a 2.9-min 720p test video, 4 CPU threads)
 
 ```
-[19:39:05] Job 20261009-193905-5900ed started (mode=local, clips=4, 15-30s)
-[19:39:06] Source: 1280x720, 2.9 min
-[19:39:24] Transcribing with faster-whisper 'small' (int8, CPU, VAD) ...
-[19:39:51] Transcription done: 393 words, language=en
-[19:39:51] Selected windows: 9.7-38.0s (score 2.58), 43.9-67.0s (score 2.51), 95.4-123.8s (score 2.55), 138.5-161.4s (score 2.36)
-[19:39:53]   clip 1: face not found, centre crop
-[19:39:53]   rendering clip_01.mp4 (9.7-38.0s) ...
-...
-[19:40:30] Finished: 4 clips in out/20261009-193905-5900ed (1.4 min)
+Job ... started (mode=local, clips=4, 15-30s, whisper=base)
+Transcription done: 393 words, language=en
+Selected windows: 9.7-38.0s, 43.9-67.0s, 95.4-123.8s, 138.5-161.4s
+Finished: 4 clips in out/<id> (≈1 min)
 
-$ ls out/20261009-193905-5900ed
+$ ls out/<id>
 captions.md  clip_01.mp4  clip_02.mp4  clip_03.mp4  clip_04.mp4  clips.zip
 ```
 
-Same video with `--mode gemini` (Vertex AI express key): Gemini picked 4 non-overlapping windows
-(5.9–28.2 s, 35.0–60.0 s, 60.1–75.7 s, 111.4–128.9 s) and wrote hooks such as *"Free video clipper? No GPU!"*
-plus hashtagged captions; the whole job took 1.8 min.
-
-Each clip: `h264 1080x1920 30 fps`, integrated loudness ≈ −14.5 LUFS. On the free 2 vCPU Space expect
-roughly 1× real time for transcription of the source plus ~10–20 s of rendering per clip.
+Each clip: `h264 1080x1920 30 fps`, integrated loudness ≈ −14.5 LUFS. In `gemini` mode (Vertex express
+key) Gemini picked 4 windows and wrote hooks such as *"Free video clipper? No GPU!"* plus hashtagged captions.
 
 ---
 
 ## Files
 
 ```
-app.py            Gradio UI (tabs: Process / Rules / History), background job + live log
-pipeline.py       download → transcribe → select → render → zip (also a CLI)
-rules.yaml        editable rules (see the Rules tab)
+app.py            Gradio UI (Process / Rules / History); job streams inside the request
+pipeline.py       download → transcribe → select → render → zip (+ GCS upload); also a CLI
+gcs.py            optional Cloud Storage persistence + signed URLs
+rules.yaml        editable rules (whisper_model, max_video_minutes, lengths, subtitles, caption template …)
 requirements.txt  Python deps
-Dockerfile        python:3.11-slim + ffmpeg + fonts + deno + pre-downloaded whisper model
-.github/workflows/sync-to-hf.yml   pushes main to the HF Space (needs HF_TOKEN secret + HF_SPACE_ID variable)
-fonts/            Montserrat-Bold.ttf (SIL OFL)
-models/           mediapipe BlazeFace short-range model (Apache-2.0)
-out/              results (created at runtime)
+Dockerfile        python:3.11-slim + ffmpeg + fonts + deno + whisper base/small baked in; listens on $PORT
+.github/workflows/deploy-cloudrun.yml   gcloud run deploy on push to main
+fonts/, models/   Montserrat-Bold.ttf (SIL OFL), mediapipe BlazeFace model (Apache-2.0)
 ```
 
 ## Notes & limits
 
-- One job at a time (single-user tool). A second **Process** click while a job runs is refused.
-- Free Spaces have no persistent disk: `out/` is wiped on restart/rebuild. Download your zips.
-- Free Spaces sleep after ~48 h without traffic; the first request wakes them (≈1 min).
-- Uploads are limited to 4 GB; sources longer than 90 min are cut to 90 min.
-- `clips_per_video` is capped at 8 in the UI.
+- One job at a time (single user, `--max-instances 1`). A second **Process** click while a job runs is refused.
+- Cloud Run request timeout is 60 min; `max_video_minutes: 60` with `base` keeps jobs well under that. If a job
+  could exceed it, lower `max_video_minutes` or `clips_per_video`.
+- Local disk is ephemeral: anything not in the bucket disappears when the instance is replaced.
+- Cold start after idle ≈ 20–40 s (large image + model load).

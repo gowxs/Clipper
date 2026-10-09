@@ -6,11 +6,9 @@ Designed for a free Hugging Face Space (2 vCPU, 16 GB RAM, no GPU).
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 import shutil
-import struct
 import subprocess
 import threading
 import time
@@ -32,8 +30,9 @@ MODELS_DIR = BASE_DIR / "models"
 RULES_PATH = BASE_DIR / "rules.yaml"
 HISTORY_PATH = OUT_DIR / "history.json"
 
-MAX_SOURCE_SECONDS = 90 * 60          # long videos are trimmed to 90 min
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")
+DEFAULT_MAX_VIDEO_MINUTES = 60        # long videos are trimmed (rules.yaml: max_video_minutes)
+ALLOWED_WHISPER_MODELS = ("tiny", "base", "small")
+DEFAULT_WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "base")
 FACE_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/face_detector/"
     "blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
@@ -44,6 +43,8 @@ DEFAULT_RULES: dict = {
     "min_len": 15,
     "max_len": 30,
     "clips_per_video": 4,
+    "whisper_model": "base",
+    "max_video_minutes": 60,
     "banned_words": [],
     "keywords_boost": [],
     "hook_style": "text_overlay",
@@ -67,6 +68,12 @@ max_len: 30
 
 # How many clips to produce per video (UI caps this at 8)
 clips_per_video: 4
+
+# faster-whisper model: base (fast, ~0.3x realtime on 2 vCPU) | small (more accurate, ~1x realtime)
+whisper_model: base
+
+# Sources longer than this are trimmed to the first N minutes (keeps Cloud Run time/cost bounded)
+max_video_minutes: 60
 
 # Windows containing these words are penalised (case-insensitive)
 banned_words: []
@@ -101,7 +108,7 @@ audience_notes: |
 
 _history_lock = threading.Lock()
 _whisper_lock = threading.Lock()
-_whisper_model = None
+_whisper_models: dict[str, object] = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -142,6 +149,10 @@ def save_rules_text(text: str, path: Path = RULES_PATH) -> dict:
         raise ValueError("min_len must be > 0 and max_len > min_len")
     if int(merged["clips_per_video"]) < 1:
         raise ValueError("clips_per_video must be >= 1")
+    if str(merged.get("whisper_model", "base")) not in ALLOWED_WHISPER_MODELS:
+        raise ValueError(f"whisper_model must be one of {', '.join(ALLOWED_WHISPER_MODELS)}")
+    if float(merged.get("max_video_minutes", 60)) <= 0:
+        raise ValueError("max_video_minutes must be > 0")
     path.write_text(text, encoding="utf-8")
     return merged
 
@@ -161,6 +172,7 @@ class Job:
     zip_path: Optional[str] = None
     captions_path: Optional[str] = None
     error: Optional[str] = None
+    gcs: dict = field(default_factory=dict)
     started_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -247,6 +259,12 @@ def download_source(url: str, workdir: Path, cookies: Optional[str], job: Job) -
     """Return (local_path, title)."""
     workdir.mkdir(parents=True, exist_ok=True)
     url = url.strip()
+    if url.startswith("gs://"):
+        import gcs
+
+        job.log(f"Downloading from Cloud Storage: {url}")
+        path = gcs.download_gs_uri(url, workdir / "gcs")
+        return str(path), path.stem
     if is_google_drive(url):
         import gdown
 
@@ -311,12 +329,13 @@ def download_source(url: str, workdir: Path, cookies: Optional[str], job: Job) -
     return str(candidates[0]), title or "video"
 
 
-def limit_duration(src: str, workdir: Path, job: Job) -> str:
+def limit_duration(src: str, workdir: Path, job: Job, max_minutes: float = DEFAULT_MAX_VIDEO_MINUTES) -> str:
     info = probe_video(src)
-    if info["duration"] > MAX_SOURCE_SECONDS:
-        job.log(f"Source is {info['duration']/60:.1f} min — trimming to the first 90 min.")
+    max_seconds = float(max_minutes) * 60
+    if info["duration"] > max_seconds + 1:
+        job.log(f"Source is {info['duration']/60:.1f} min — trimming to the first {max_minutes:g} min.")
         trimmed = str(workdir / "source_trimmed.mp4")
-        run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-t", str(MAX_SOURCE_SECONDS),
+        run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-t", str(max_seconds),
              "-c", "copy", "-movflags", "+faststart", trimmed])
         return trimmed
     return src
@@ -337,16 +356,18 @@ def load_wav_mono16k(wav_path: str) -> np.ndarray:
     return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
 
-def get_whisper():
-    global _whisper_model
+def get_whisper(name: str = DEFAULT_WHISPER_MODEL):
+    name = name if name in ALLOWED_WHISPER_MODELS else DEFAULT_WHISPER_MODEL
     with _whisper_lock:
-        if _whisper_model is None:
+        if name not in _whisper_models:
             from faster_whisper import WhisperModel
 
             threads = max(1, min(4, os.cpu_count() or 2))
-            _whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8",
-                                          cpu_threads=threads, num_workers=1)
-        return _whisper_model
+            # keep only one model resident (4 GiB Cloud Run instance)
+            _whisper_models.clear()
+            _whisper_models[name] = WhisperModel(name, device="cpu", compute_type="int8",
+                                                 cpu_threads=threads, num_workers=1)
+        return _whisper_models[name]
 
 
 @dataclass
@@ -357,10 +378,11 @@ class Word:
     prob: float = 1.0
 
 
-def transcribe(wav_path: str, job: Job, total_dur: float) -> tuple[list[Word], list[dict], str]:
+def transcribe(wav_path: str, job: Job, total_dur: float,
+               model_name: str = DEFAULT_WHISPER_MODEL) -> tuple[list[Word], list[dict], str]:
     """Return (words, segments, language)."""
-    model = get_whisper()
-    job.log(f"Transcribing with faster-whisper '{WHISPER_MODEL}' (int8, CPU, VAD) ...")
+    model = get_whisper(model_name)
+    job.log(f"Transcribing with faster-whisper '{model_name}' (int8, CPU, VAD) ...")
     # decode with ffmpeg (already done) and hand whisper a float32 array -> no PyAV version issues
     audio = load_wav_mono16k(wav_path)
     segments_iter, info = model.transcribe(
@@ -978,6 +1000,12 @@ def make_zip(out_dir: Path, files: list[Path]) -> Path:
 
 
 def load_history() -> list[dict]:
+    import gcs
+
+    if gcs.enabled():
+        remote = gcs.load_history()
+        if remote is not None:
+            return remote
     if HISTORY_PATH.exists():
         try:
             return json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
@@ -994,9 +1022,13 @@ def append_history(entry: dict, keep: int = 20):
         hist = hist[:keep]
         OUT_DIR.mkdir(parents=True, exist_ok=True)
         HISTORY_PATH.write_text(json.dumps(hist, ensure_ascii=False, indent=1), encoding="utf-8")
+        import gcs
+
+        gcs.save_history(hist)
     # drop output folders that fell off the history
     for old in removed:
         shutil.rmtree(OUT_DIR / old["id"], ignore_errors=True)
+        gcs.delete_job(old["id"])
 
 
 # --------------------------------------------------------------------------- #
@@ -1013,7 +1045,8 @@ def process(job: Job, url: str = "", local_file: Optional[str] = None, cookies_p
         workdir.mkdir(parents=True, exist_ok=True)
         out_dir.mkdir(parents=True, exist_ok=True)
         job.log(f"Job {job.id} started (mode={mode}, clips={rules['clips_per_video']}, "
-                f"{rules['min_len']}-{rules['max_len']}s)", progress=0.01)
+                f"{rules['min_len']}-{rules['max_len']}s, whisper={rules.get('whisper_model', DEFAULT_WHISPER_MODEL)})",
+                progress=0.01)
 
         # 1) source
         if local_file:
@@ -1026,7 +1059,7 @@ def process(job: Job, url: str = "", local_file: Optional[str] = None, cookies_p
             raise RuntimeError("Provide a URL or upload a video file")
         job.title = title
         job.log(f"Title: {title}", progress=0.1)
-        src = limit_duration(src, workdir, job)
+        src = limit_duration(src, workdir, job, float(rules.get("max_video_minutes", DEFAULT_MAX_VIDEO_MINUTES)))
         info = probe_video(src)
         job.log(f"Source: {info['width']}x{info['height']}, {info['duration']/60:.1f} min")
 
@@ -1034,7 +1067,7 @@ def process(job: Job, url: str = "", local_file: Optional[str] = None, cookies_p
         wav = str(workdir / "audio.wav")
         extract_audio(src, wav)
         job.log("Audio extracted", progress=0.15)
-        words, segments, lang = transcribe(wav, job, info["duration"])
+        words, segments, lang = transcribe(wav, job, info["duration"], str(rules.get("whisper_model", DEFAULT_WHISPER_MODEL)))
 
         # 3) selection
         rms, hop = audio_rms_curve(wav)
@@ -1075,6 +1108,18 @@ def process(job: Job, url: str = "", local_file: Optional[str] = None, cookies_p
         zp = make_zip(out_dir, rendered + [captions])
         job.captions_path = str(captions)
         job.zip_path = str(zp)
+        gcs_uris: dict[str, str] = {}
+        import gcs
+
+        if gcs.enabled():
+            try:
+                job.log(f"Uploading clips.zip + captions.md to gs://{gcs.BUCKET}/{gcs.job_prefix(job.id)}/ ...",
+                        progress=0.97)
+                gcs_uris["zip"] = gcs.upload_file(zp, job.id) or ""
+                gcs_uris["captions"] = gcs.upload_file(captions, job.id) or ""
+                job.gcs = gcs_uris
+            except Exception as e:
+                job.log(f"GCS upload failed ({e}) — results are only on local disk.")
         job.status = "done"
         job.finished_at = time.time()
         job.log(f"Finished: {len(rendered)} clips in {out_dir} ({(job.finished_at - job.started_at)/60:.1f} min)",
@@ -1082,9 +1127,9 @@ def process(job: Job, url: str = "", local_file: Optional[str] = None, cookies_p
         append_history({
             "id": job.id, "title": title, "source": job.source, "mode": mode,
             "finished": time.strftime("%Y-%m-%d %H:%M"),
-            "clips": [{"file": Path(c["file"]).name, "start": c["start"], "end": c["end"], "hook": c["hook"]}
-                      for c in job.clips],
-            "zip": zp.name, "captions": captions.name,
+            "clips": [{"file": Path(c["file"]).name, "start": c["start"], "end": c["end"], "hook": c["hook"],
+                       "caption": c["caption"]} for c in job.clips],
+            "zip": zp.name, "captions": captions.name, "gcs": gcs_uris,
         })
     except Exception as e:
         job.status = "error"

@@ -7,6 +7,12 @@ max_len: 30
 # How many clips to produce per video (UI caps this at 8)
 clips_per_video: 4
 
+# faster-whisper model: base (fast, ~0.3x realtime on 2 vCPU) | small (more accurate, ~1x realtime)
+whisper_model: base
+
+# Sources longer than this are trimmed to the first N minutes (keeps Cloud Run time/cost bounded)
+max_video_minutes: 60
+
 # Windows containing these words are penalised (case-insensitive)
 banned_words: []
 

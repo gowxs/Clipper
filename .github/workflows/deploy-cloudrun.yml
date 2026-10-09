@@ -1,0 +1,89 @@
+# Deploys Clipper to Google Cloud Run on every push to `main`.
+#
+# One-time setup (README → "Deploy to Google Cloud Run"):
+#   GitHub → Settings → Secrets and variables → Actions
+#     Secrets:   GCP_SA_KEY       service-account JSON key
+#                PASSWORD         UI password
+#                GEMINI_API_KEY   (optional) Gemini / Vertex AI express key
+#     Variables: GCP_PROJECT_ID   GCP project id
+#                GCS_BUCKET       (optional) bucket for clips.zip / captions.md / history
+#                GCP_REGION       (optional, default europe-west1)
+#                CLOUD_RUN_SA     (optional) runtime service-account e-mail
+name: Deploy to Cloud Run
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-cloudrun
+  cancel-in-progress: true
+
+env:
+  SERVICE: clipper
+  REGION: ${{ vars.GCP_REGION || 'europe-west1' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ vars.GCP_PROJECT_ID != '' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Write runtime env vars file
+        env:
+          PASSWORD: ${{ secrets.PASSWORD }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GCS_BUCKET: ${{ vars.GCS_BUCKET }}
+        run: |
+          set -euo pipefail
+          test -n "$PASSWORD" || { echo "PASSWORD secret is missing"; exit 1; }
+          python3 - <<'PY'
+          import json, os
+          env = {
+              "PASSWORD": os.environ["PASSWORD"],
+              "GEMINI_API_KEY": os.environ.get("GEMINI_API_KEY", ""),
+              "GCS_BUCKET": os.environ.get("GCS_BUCKET", ""),
+              "GRADIO_ANALYTICS_ENABLED": "False",
+          }
+          # JSON is valid YAML; values are quoted so special characters are safe
+          with open("env.yaml", "w") as f:
+              json.dump({k: str(v) for k, v in env.items()}, f)
+          PY
+
+      - name: Deploy
+        run: |
+          set -euo pipefail
+          EXTRA=()
+          if [ -n "${{ vars.CLOUD_RUN_SA }}" ]; then EXTRA+=(--service-account "${{ vars.CLOUD_RUN_SA }}"); fi
+          gcloud run deploy "$SERVICE" \
+            --source . \
+            --region "$REGION" \
+            --platform managed \
+            --cpu 2 \
+            --memory 4Gi \
+            --timeout 3600 \
+            --min-instances 0 \
+            --max-instances 1 \
+            --concurrency 4 \
+            --allow-unauthenticated \
+            --session-affinity \
+            --execution-environment gen2 \
+            --env-vars-file env.yaml \
+            --quiet \
+            "${EXTRA[@]}"
+          rm -f env.yaml
+          echo "URL: $(gcloud run services describe "$SERVICE" --region "$REGION" --format 'value(status.url)')"

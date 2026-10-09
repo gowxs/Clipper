@@ -1,4 +1,4 @@
-# Clipper — Hugging Face Docker Space (free CPU tier)
+# Clipper — Google Cloud Run (2 vCPU / 4 GiB, CPU only). Also works with plain `docker run`.
 FROM python:3.11-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -26,14 +26,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
     && deno --version
 
-# HF Spaces run as UID 1000
+# Run as a non-root user
 RUN useradd -m -u 1000 user
 ENV HOME=/home/user \
     PATH=/home/user/.local/bin:$PATH \
     HF_HOME=/home/user/.cache/huggingface \
     GRADIO_SERVER_NAME=0.0.0.0 \
-    GRADIO_SERVER_PORT=7860 \
     GRADIO_ANALYTICS_ENABLED=False \
+    PORT=8080 \
     OMP_NUM_THREADS=2
 WORKDIR /home/user/app
 
@@ -56,13 +56,14 @@ RUN set -e; \
     mkdir -p /usr/local/share/fonts && cp fonts/*.ttf /usr/local/share/fonts/ && fc-cache -f \
     && fc-list | grep -i montserrat
 
-# Pre-download the whisper model so the first job does not wait for it
-RUN python -c "from faster_whisper import download_model; download_model('small')" \
+# Pre-download the whisper models baked into the image (rules.yaml: whisper_model base|small)
+RUN python -c "from faster_whisper import download_model; [download_model(m) for m in ('base', 'small')]" \
     && chown -R user:user /home/user/.cache
 
 COPY --chown=user . .
 RUN mkdir -p out work && chown -R user:user /home/user/app
 
 USER user
-EXPOSE 7860
+# Cloud Run injects $PORT (default 8080); app.py listens on it
+EXPOSE 8080
 CMD ["python", "app.py"]
