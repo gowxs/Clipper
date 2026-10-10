@@ -82,7 +82,7 @@ jobs:
             --allow-unauthenticated \
             --session-affinity \
             --execution-environment gen2 \
-            --use-http2 \
+            --no-use-http2 \
             --env-vars-file env.yaml \
             --quiet \
             "${EXTRA[@]}"
