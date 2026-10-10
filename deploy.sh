@@ -55,6 +55,7 @@ gcloud run deploy "$SERVICE" \
   --allow-unauthenticated \
   --session-affinity \
   --execution-environment gen2 \
+  --use-http2 \
   --set-env-vars "$ENV_VARS" \
   --quiet \
   "${EXTRA[@]}"

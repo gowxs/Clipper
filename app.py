@@ -26,7 +26,7 @@ PASSWORD = os.environ.get("PASSWORD", "").strip()
 USERNAME = os.environ.get("USERNAME", "admin").strip() or "admin"
 HAS_GEMINI = bool(os.environ.get("GEMINI_API_KEY", "").strip())
 ON_CLOUD_RUN = bool(os.environ.get("K_SERVICE"))
-MAX_UPLOAD = os.environ.get("MAX_UPLOAD", "30mb" if ON_CLOUD_RUN else "4gb")
+MAX_UPLOAD = os.environ.get("MAX_UPLOAD", "2gb")
 
 LEN_PRESETS = [("15–30 s", "15-30"), ("20–45 s", "20-45"), ("30–60 s", "30-60"), ("10–20 s", "10-20")]
 POSITIONS = ["bottom_right", "bottom_left", "top_right", "top_left"]
@@ -396,7 +396,7 @@ with gr.Blocks(title="Clipper") as demo:
         with gr.Tab(i18n.t(_lang0, "tab_main")) as tab_main:
             reg(tab_main, "tab_main", "label")
             reg(gr.Markdown(i18n.t(_lang0, "step1")), "step1", "value")
-            url_in = reg(gr.Textbox(label=i18n.t(_lang0, "url_label"), placeholder="https://…", lines=1), "url_label")
+            url_in = reg(gr.Textbox(label=i18n.t(_lang0, "url_label"), placeholder=i18n.t(_lang0, "url_ph"), lines=1), "url_label")
             video_in = reg(gr.File(label=i18n.t(_lang0, "upload_label"), file_types=["video", ".mp4", ".mkv", ".mov", ".webm"],
                                    file_count="single", height=110), "upload_label")
 
@@ -537,7 +537,7 @@ if __name__ == "__main__":
         auth=auth,
         auth_message="Clipper" if auth else None,
         allowed_paths=[str(pl.OUT_DIR)],
-        max_file_size=MAX_UPLOAD,
+        max_file_size="2gb",
         show_error=True,
         theme=gr.themes.Soft(primary_hue="orange", neutral_hue="zinc"),
         css=CSS,

@@ -202,8 +202,8 @@ that job; `(none)` disables it; `(rules.yaml default)` follows the rules file. C
 
 ### Uploads on Cloud Run
 
-Cloud Run rejects HTTP/1 request bodies above 32 MiB, so the upload field is limited to 30 MB there.
-For bigger sources use a link, or put the file in the bucket and paste its `gs://` path:
+HTTP/2 (`--use-http2`) is enabled on Cloud Run to bypass the 32 MiB HTTP/1.1 request body limit, allowing direct file uploads up to 2 GB (`max_file_size="2gb"`).
+For bigger sources or faster uploads, you can also paste a link or put the file in the bucket and paste its `gs://` path:
 
 ```bash
 gcloud storage cp my_video.mp4 gs://BUCKET/uploads/
