@@ -24,6 +24,9 @@ import numpy as np
 import yaml
 
 BASE_DIR = Path(__file__).resolve().parent
+_venv_bin = str(Path(sys.executable).parent)
+if _venv_bin not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = _venv_bin + os.pathsep + os.environ.get("PATH", "")
 OUT_DIR = Path(os.environ.get("CLIPPER_OUT", BASE_DIR / "out"))
 WORK_DIR = Path(os.environ.get("CLIPPER_WORK", BASE_DIR / "work"))
 FONTS_DIR = BASE_DIR / "fonts"
